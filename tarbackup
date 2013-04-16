@@ -1,0 +1,234 @@
+#!/bin/bash
+
+# 'tarbackup' -- updated version of 'dobackup' script for doing
+#                system-level backups.
+#
+# PREREQUISITES:
+#
+# for this script to work, you need the following utilities in the 
+# default root path on both the remote and local system:
+#
+# a tar(1) that handles >2GB files (gnu tar works),
+# date(1) that understands '+%j', rm(1), a posix-compliant
+# sh(1) (ksh, bash, or ash will work), cat(1), sort(1), sed(1), and
+# ssh set up to allow the local backup host to login as root on the 
+# remote target-host, without a password. 
+
+if [ $# = 0 ]
+then
+    echo ""
+    echo "usage: DUMPDIR=ddd TARGETS=ttt $0 host key type"
+    echo ""
+    echo "DUMPDIR  is the absolute directory the dump will be written to."
+    echo ""
+    echo "TARGETS  is a list (enclosed in double quotes) of one"
+    echo "         or more absolute directory names you want to back up"
+    echo "         from the target-host."
+    echo ""
+    echo "host     is the hostname of the target-host, i.e., the host"
+    echo "         that has the files you want to back up."
+    echo ""
+    echo "key      is a symbolic key (a simple identifier) that represents"
+    echo "         the set of directories to be backed up."
+    echo ""
+    echo "type     is one of {full,diff,incr}, and represents what type"
+    echo "         of backup this is."
+    echo ""
+    exit 1
+fi
+
+host=$1
+key=$2
+dumptype=$3
+
+# the following little bit of shell-magic means:  let 'dumpdir'
+# be whatever is in the DUMPDIR environment variable, and if 
+# the DUMPDIR variable is not defined, die with an error message.
+# (likewise for 'targets').
+
+dumpdir=${DUMPDIR:?}
+targets=${TARGETS:?}
+
+if [ ! -d $dumpdir ]
+then
+    echo "error: dump directory [$dumpdir] does not exist"
+    exit 1
+fi
+
+# the 'date +%j' command returns today's date, as a day number in 
+# the year.  January 1 is 1, ... December 31 is 365, etc.
+
+today=`date +%j`
+
+last_incr=0
+last_diff=0
+last_full=0
+
+INCR_DATE_FILE=$dumpdir/$key.last.incr
+DIFF_DATE_FILE=$dumpdir/$key.last.diff
+FULL_DATE_FILE=$dumpdir/$key.last.full
+
+[ -f $INCR_DATE_FILE ] && last_incr=`cat $INCR_DATE_FILE`
+[ -f $DIFF_DATE_FILE ] && last_diff=`cat $DIFF_DATE_FILE`
+[ -f $FULL_DATE_FILE ] && last_full=`cat $FULL_DATE_FILE`
+
+# get delta for diffs or incrs.  do nothing for fulls.
+#
+# the delta is a number that represents how old the oldest
+# files in this dump will be.  e.g. delta=3 means this dump
+# will have files that were modified no more than 3 days ago.
+# 
+# for a full, we're going to get all the files, regardless of 
+# how old they are, so the delta isn't meaningful in this case.
+
+case $dumptype
+in
+    diff)
+        if [ $last_diff -gt $last_full ]
+        then
+            # backup since last diff.
+            delta=`expr $today - $last_diff`
+        else
+            # backup since last full.
+            delta=`expr $today - $last_full`
+        fi
+        ;;
+
+    incr)
+        if [ $last_incr -gt $last_diff -a $last_incr -gt $last_full ]
+        then
+            # backup since last incr.
+            delta=`expr $today - $last_incr`
+        elif [ $last_diff -gt $last_incr -a $last_diff -gt $last_full ]
+        then
+            # backup since last diff.
+            delta=`expr $today - $last_diff`
+        else
+            # backup since last full.
+            delta=`expr $today - $last_full`
+        fi
+        ;;
+
+    *)
+        delta=not_applicable
+        ;;
+esac
+
+# generate list of files and directories to dump.
+
+if [ $host = `hostname` ]
+then
+    # this is a local backup.
+    targloc=local
+    case $dumptype
+    in
+        full)
+            find $targets -xdev \( -type f -o -type l \)  > $dumpdir/dumpfiles.raw
+            ;;
+
+        diff|incr)
+            find $targets \( -type f -o -type l \) -xdev -mtime -$delta > $dumpdir/dumpfiles.raw
+            ;;
+   
+        *)
+            echo "error: unknown dump type : $dumptype"
+            exit 1
+            ;;
+    esac
+
+    # remove leading '/' from filenames.
+    sed -e 's,^/,,' $dumpdir/dumpfiles.raw > $dumpdir/dumpfiles.prefilt
+
+else
+    # this is a remote backup.
+    targloc=remote
+    case $dumptype
+    in
+        full)
+            ssh -q -l root $host "find $targets \( -type f -o -type l \) -xdev" > $dumpdir/dumpfiles.raw
+            ;;
+
+        diff|incr)
+            ssh -q -l root $host "find $targets \( -type f -o -type l \) -xdev -mtime -$delta" > $dumpdir/dumpfiles.raw
+            ;;
+   
+        *)
+            echo "error: unknown dump type : $dumptype"
+            exit 1
+            ;;
+    esac
+
+    # remove leading '/' from filenames.
+    sed -e 's,^/,,' $dumpdir/dumpfiles.raw > $dumpdir/dumpfiles.prefilt
+
+fi
+
+# filter out names of files to exclude from dump.  this is key-specific.  
+# we source a file in the dumpdir called '$key.dumpfilter' which will 
+# define a shell alias or shell function called 'dumpfilter'.  The 
+# 'dumpfilter' function strains out any unwanted files or directories 
+# from the list of files to be dumped.  for example, if you wanted to 
+# filter out all web-browser cache files, you could do this with:
+#     dumpfilter(){
+#         grep -i -v cache $1
+#     }
+#
+# if you don't want to filter anything, define 'dumpfilter' to be 'cat'.
+# you could do this either as an alias:
+#     alias dumpfilter=cat
+# or you could do this as a shell function:
+#     dumpfilter(){
+#         cat $1
+#     }
+
+if [ -f $dumpdir/$key.dumpfilter ]
+then
+    . $dumpdir/$key.dumpfilter
+    dumpfilter $dumpdir/dumpfiles.prefilt > $dumpdir/dumpfiles.postfilt
+else
+    echo "error: dumpfilter [$dumpdir/$key.dumpfilter] not found"
+    exit 1
+fi
+
+# feed list of filtered filenames into backup utility, 
+# which will spew to standard output.
+
+if [ $targloc = local ]
+then
+    # this is a local dump.
+    (
+    cd /
+    tar -T $dumpdir/dumpfiles.postfilt -c -f $dumpdir/`date +%Y-%m%d-$host-$key-$dumptype.tar`
+    )
+else
+    # this is a remote dump.
+
+    #cat $dumpdir/dumpfiles.postfilt |\
+    #    ssh -l root $host 'cd /; star c list=-' >\
+    #    $dumpdir/`date +%Y-%m%d-$host-$key-$dumptype.star`
+
+    cat $dumpdir/dumpfiles.postfilt |\
+        ssh -q -l root $host "cat > /tmp/$key.dumpfiles"
+    ssh -q -l root $host "cd /;/bin/tar -T /tmp/$key.dumpfiles -cf -" |\
+        cat > $dumpdir/`date +%Y-%m%d-$host-$key-$dumptype.tar`
+fi
+
+#DEBUG=1
+if [ x$DEBUG = x ]
+then
+    (
+    cd $dumpdir
+    rm dumpfiles.raw dumpfiles.prefilt dumpfiles.postfilt
+    )
+fi
+
+# make index file of dump.
+tar tf $dumpdir/`date +%Y-%m%d-$host-$key-$dumptype.tar` |\
+    grep -v '^/' |\
+    sort -u > $dumpdir/`date +%Y-%m%d-$host-$key-$dumptype.index`
+
+[ $dumptype = incr ] && date +%j > $INCR_DATE_FILE
+[ $dumptype = diff ] && date +%j > $DIFF_DATE_FILE
+[ $dumptype = full ] && date +%j > $FULL_DATE_FILE
+
+# end of script.
